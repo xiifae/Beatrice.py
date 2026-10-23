@@ -58,13 +58,16 @@ def find_twoins(prev, insn):
             instr1 = prev.mnemonic + " " + prev.op_str
             instr2 = insn.mnemonic + " " + insn.op_str
             twoins = instr1 + "; " + instr2
-            movadd.append(twoins)
+            if "rip" not in twoins:
+                movadd.append(twoins)
             
         elif (prev.mnemonic == "mov" and prev.op_str.startswith("r") and ", r" in prev.op_str and "0x" in insn.op_str) or (insn.mnemonic == "mov" and  insn.op_str.startswith("r") and ", r" in insn.op_str and "0x" in prev.op_str):
             instr1 = prev.mnemonic + " " + prev.op_str
             instr2 = insn.mnemonic + " " + insn.op_str
             twoins = instr1 + "; " + instr2
-            if "+ 0x" in twoins:
+            if "rip" in twoins:
+                pass
+            elif "+ 0x" in twoins:
                 if len(twoins[twoins.index("+ 0x"):]) < 10:
                     movcomplex.append(twoins)
             else:
@@ -73,11 +76,14 @@ def find_twoins(prev, insn):
         elif (prev.mnemonic == "xor" and prev.op_str[0].isalpha() and ", " in prev.op_str and "0x" in insn.op_str) or (insn.mnemonic == "xor" and  insn.op_str[0].isalpha() and ", r" in insn.op_str and "0x" in prev.op_str):
             instr1 = prev.mnemonic + " " + prev.op_str
             instr2 = insn.mnemonic + " " + insn.op_str
-            try:
-                if (instr1.split(",")[0][3:]==instr1.split(",")[1] or instr2.split(",")[0][3:]==instr2.split(",")[1] ):
-                   xorcomplex.append(instr1 + "; " + instr2)
-            except Exception:
+            if "rip" in instr1 or "rip" in instr2:
                 pass
+            else:
+                try:
+                    if (instr1.split(",")[0][3:]==instr1.split(",")[1] or instr2.split(",")[0][3:]==instr2.split(",")[1] ):
+                       xorcomplex.append(instr1 + "; " + instr2)
+                except Exception:
+                    pass
 
     return insn
 
@@ -137,7 +143,30 @@ def build_trie(patches):
     return root
 
 
-def patch_binary(data: bytes, patches):
+def get_executable_ranges(data):
+    if not is_pe(data):
+        return None
+    pe = pefile.PE(data=data, fast_load=True)
+    pe.parse_data_directories(directories=[])
+    ranges = []
+    for section in pe.sections:
+        if section.Characteristics & 0x20000000:
+            start = section.PointerToRawData
+            end = start + section.SizeOfRawData
+            ranges.append((start, end))
+    return ranges
+
+
+def in_executable_range(offset, ranges):
+    if ranges is None:
+        return True
+    for start, end in ranges:
+        if start <= offset < end:
+            return True
+    return False
+
+
+def patch_binary(data: bytes, patches, exec_ranges=None):
     root = build_trie(patches)
 
     output = bytearray(data)
@@ -148,6 +177,10 @@ def patch_binary(data: bytes, patches):
 
     i = 0
     while i < n:
+        if exec_ranges is not None and not in_executable_range(i, exec_ranges):
+            i += 1
+            continue
+
         node = root
         j = i
         last_match = None  # (end_index, replacement)
@@ -423,9 +456,11 @@ def main():
     if ("-s" in sys.argv):
         print("[*] Using safer mode")
     complexops = []
+    exec_ranges = None
     if is_pe(data):
         print("[+] Detected PE file")
         handle_pe(data, complexops)
+        exec_ranges = get_executable_ranges(data)
     else:
         print("[+] Treating as raw binary")
         handle_raw(data, complexops)
@@ -680,17 +715,17 @@ def main():
         (b"\x8B\x45\xFC\x01\xC2", b"\x90\x03\x55\xFC\x90"),
     ])
     
-    patched, total = patch_binary(data, patches)
+    patched, total = patch_binary(data, patches, exec_ranges)
     ftotal = total
 
     with open(filename, "wb") as f:
         f.write(patched)
-    
+
     patches.clear()
-    
+
     with open(filename, "rb") as f:
         data = f.read()
-        
+
     altencoding_patterns = [
         ("mov {a},{b}", "mov {a},{b}"),
         ("xor {a},{a}", "xor {a},{a}"),
@@ -702,14 +737,14 @@ def main():
     generate_patches(allreg, altencoding_patterns, altencoding=True)
     print("[+] Applying alternative encoding")
 
-    patched, total = patch_binary(data, patches)
-    
+    patched, total = patch_binary(data, patches, exec_ranges)
+
     if total == 0:
         l2 = [(y, x) for (x, y) in ALT_ENCODINGS]
         ALT_ENCODINGS.clear()
         ALT_ENCODINGS.extend(l2)
         generate_patches(allreg, altencoding_patterns, altencoding=True)
-        patched, total = patch_binary(data, patches)
+        patched, total = patch_binary(data, patches, exec_ranges)
     ftotal = ftotal + total
     print(f"[+] Total applied patches: {ftotal}")
 
